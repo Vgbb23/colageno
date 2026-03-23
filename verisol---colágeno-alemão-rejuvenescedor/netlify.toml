@@ -1,0 +1,27 @@
+ # Build do frontend (Vite)
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+# Variáveis de ambiente para a função create-pix (configurar no painel Netlify)
+# FRUITFY_API_TOKEN, FRUITFY_STORE_ID, FRUITFY_PRODUCT_ID
+
+# Rotas: API PIX e fallback SPA
+[[redirects]]
+  from = "/api/create-pix"
+  to = "/.netlify/functions/create-pix"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/order-status/:orderId"
+  to = "/.netlify/functions/order-status/:orderId"
+  status = 200
+  force = true
+
+# SPA: todas as rotas servem index.html para o React Router
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
