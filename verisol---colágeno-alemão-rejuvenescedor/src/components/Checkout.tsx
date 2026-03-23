@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { 
   ShieldCheck, 
@@ -18,6 +18,11 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { buildObrigadoQueryString, collectUtmParamsFromSearch } from '../utils/utm';
 import { setObrigadoUnlock } from '../utils/campaignQuery';
+import {
+  encodeUpsellCustomerPrefill,
+  isFruitfyOrderPaid,
+  normalizePhoneForUpsell,
+} from '../utils/postPaymentRedirect';
 
 interface Product {
   id: number;
@@ -371,6 +376,11 @@ export default function Checkout({ onBack, product }: CheckoutProps) {
         orderId={pixResult.orderId}
         onBack={onBack}
         onPaidConfirmed={goObrigado}
+        utmSearch={location.search || ''}
+        redirectName={name.trim()}
+        redirectEmail={email.trim()}
+        redirectPhone={phone}
+        redirectCpfDigits={cpfDigits}
       />
     );
   }
@@ -744,22 +754,38 @@ function Step({ num, label, active }: { num: number, label: string, active?: boo
   );
 }
 
+const POLL_ORDER_MS = 200;
+const REDIRECT_AFTER_PAID_MS = 1200;
+
 function SuccessScreen({
   total,
   pixCopyPaste,
   orderId,
   onBack,
   onPaidConfirmed,
+  utmSearch,
+  redirectName,
+  redirectEmail,
+  redirectPhone,
+  redirectCpfDigits,
 }: {
   total: number;
   pixCopyPaste: string;
   orderId?: string;
   onBack: () => void;
   onPaidConfirmed: () => void;
+  utmSearch: string;
+  redirectName: string;
+  redirectEmail: string;
+  redirectPhone: string;
+  redirectCpfDigits: string;
 }) {
   const [reservationTime, setReservationTime] = useState({ minutes: 29, seconds: 59 });
-  const [checkingPayment, setCheckingPayment] = useState(false);
   const [statusMessage, setStatusMessage] = useState('Aguardando pagamento...');
+  const [isPaymentApproved, setIsPaymentApproved] = useState(false);
+  const hasRedirectedAfterPayment = useRef(false);
+
+  const postPaymentUrl = ((import.meta.env.VITE_POST_PAYMENT_REDIRECT_URL as string) || '').trim();
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -773,47 +799,95 @@ function SuccessScreen({
   }, []);
 
   useEffect(() => {
-    if (!orderId) {
-      setStatusMessage(
-        'Não foi possível verificar o pagamento automaticamente (pedido sem ID). Guarde o comprovante do PIX e fale com o suporte.'
-      );
-      return;
+    if (!orderId || hasRedirectedAfterPayment.current) {
+      if (!orderId) {
+        setStatusMessage(
+          'Não foi possível verificar o pagamento automaticamente (pedido sem ID). Guarde o comprovante do PIX e fale com o suporte.'
+        );
+      }
+      return undefined;
     }
 
-    let mounted = true;
-    let timer: ReturnType<typeof setTimeout> | null = null;
+    let isCancelled = false;
+    let inFlight = false;
 
-    const checkStatus = async () => {
-      if (!mounted) return;
-      setCheckingPayment(true);
+    const checkOrderStatus = async () => {
+      if (isCancelled || hasRedirectedAfterPayment.current || inFlight) return;
+      inFlight = true;
       try {
         const apiBase = ((import.meta.env.VITE_API_URL as string) || '').replace(/\/$/, '');
-        const url = apiBase ? `${apiBase}/api/order-status/${orderId}` : `/api/order-status/${orderId}`;
+        const path = `/api/order/${encodeURIComponent(orderId)}`;
+        const url = apiBase ? `${apiBase}${path}` : path;
         const res = await fetch(url, { method: 'GET', headers: { Accept: 'application/json' } });
-        const json = await res.json().catch(() => ({} as Record<string, unknown>));
-        const paid = !!(json as { paid?: boolean }).paid;
-        if (paid) {
-          setStatusMessage('Pagamento confirmado! Redirecionando...');
-          setTimeout(() => {
-            if (mounted) onPaidConfirmed();
-          }, 900);
+        if (!res.ok) return;
+
+        const orderResponse = await res.json().catch(() => null);
+        if (!isFruitfyOrderPaid(orderResponse)) {
+          setStatusMessage('Aguardando confirmação do pagamento pela operadora...');
           return;
         }
-        setStatusMessage('Aguardando confirmação do pagamento pela operadora...');
+
+        hasRedirectedAfterPayment.current = true;
+        setIsPaymentApproved(true);
+        setStatusMessage('Pagamento confirmado! Redirecionando...');
+
+        window.setTimeout(() => {
+          if (isCancelled) return;
+
+          if (postPaymentUrl) {
+            try {
+              const nextUrl = new URL(postPaymentUrl);
+              const q = utmSearch.startsWith('?') ? utmSearch.slice(1) : utmSearch;
+              const params = new URLSearchParams(q);
+              params.set('orderId', orderId);
+              try {
+                params.set(
+                  'prefill',
+                  encodeUpsellCustomerPrefill({
+                    n: redirectName,
+                    e: redirectEmail,
+                    p: normalizePhoneForUpsell(redirectPhone),
+                    c: redirectCpfDigits,
+                  })
+                );
+              } catch {
+                /* segue só com orderId + UTMs */
+              }
+              nextUrl.search = params.toString();
+              window.location.href = nextUrl.toString();
+            } catch {
+              onPaidConfirmed();
+            }
+          } else {
+            onPaidConfirmed();
+          }
+        }, REDIRECT_AFTER_PAID_MS);
       } catch {
-        setStatusMessage('Verificando pagamento...');
+        if (!isCancelled) setStatusMessage('Verificando pagamento...');
       } finally {
-        if (mounted) setCheckingPayment(false);
+        inFlight = false;
       }
-      if (mounted) timer = setTimeout(checkStatus, 4000);
     };
 
-    timer = setTimeout(checkStatus, 1200);
+    void checkOrderStatus();
+    const intervalId = window.setInterval(() => {
+      void checkOrderStatus();
+    }, POLL_ORDER_MS);
+
     return () => {
-      mounted = false;
-      if (timer) clearTimeout(timer);
+      isCancelled = true;
+      window.clearInterval(intervalId);
     };
-  }, [orderId, onPaidConfirmed]);
+  }, [
+    orderId,
+    onPaidConfirmed,
+    postPaymentUrl,
+    redirectCpfDigits,
+    redirectEmail,
+    redirectName,
+    redirectPhone,
+    utmSearch,
+  ]);
 
   const [showToast, setShowToast] = useState(false);
 
@@ -909,9 +983,19 @@ function SuccessScreen({
                 Expira em: <span className="font-mono">{String(reservationTime.minutes).padStart(2, '0')}:{String(reservationTime.seconds).padStart(2, '0')}</span>
               </p>
             </div>
-            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Aguardando pagamento...</p>
+            <p className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+              {isPaymentApproved ? 'Pagamento aprovado!' : 'Aguardando pagamento...'}
+            </p>
             <p className="text-sm font-black text-purple-900 mt-1">Valor: R$ {total.toFixed(2).replace('.', ',')}</p>
           </div>
+
+          {isPaymentApproved && (
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 -mt-4">
+              <p className="text-xs font-bold text-emerald-700 uppercase tracking-wide text-center">
+                Pagamento aprovado, redirecionando...
+              </p>
+            </div>
+          )}
 
           {/* Copy Paste Section */}
           <div className="space-y-4">
@@ -962,13 +1046,10 @@ function SuccessScreen({
             {statusMessage}
           </p>
           <p className="text-[10px] text-gray-400 font-medium px-2">
-            A página será redirecionada automaticamente para “Obrigado” quando o pagamento for confirmado.
+            {postPaymentUrl
+              ? 'Ao confirmar o PIX, você será redirecionado para a próxima página (UTMs e orderId vão na URL).'
+              : 'A página será redirecionada automaticamente para “Obrigado” quando o pagamento for confirmado.'}
           </p>
-          {checkingPayment && (
-            <div className="flex justify-center">
-              <div className="h-5 w-5 border-2 border-purple-600 border-t-transparent rounded-full animate-spin" />
-            </div>
-          )}
           <div className="flex items-center justify-center gap-6 opacity-40">
             <ShieldCheck className="h-6 w-6" />
             <Lock className="h-6 w-6" />

@@ -231,6 +231,42 @@ app.get('/api/last-pix-response', (_req, res) => {
   res.send(JSON.stringify(lastFruitfyResponse, null, 2));
 });
 
+/** Igual testohardcomutm: resposta JSON bruta da Fruitfy para polling (paid_at / status). */
+app.get('/api/order/:orderId', async (req, res) => {
+  if (!TOKEN || !STORE_ID) {
+    return res.status(500).json({
+      success: false,
+      message: 'Configuração da API Fruitfy incompleta (FRUITFY_API_TOKEN, FRUITFY_STORE_ID).',
+    });
+  }
+  const orderId = String(req.params.orderId || '').trim();
+  if (!orderId) {
+    return res.status(400).json({ success: false, message: 'ID do pedido inválido.' });
+  }
+  try {
+    const orderRes = await fetch(`${FRUITFY_BASE}/api/order/${encodeURIComponent(orderId)}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        'Store-Id': STORE_ID,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Accept-Language': 'pt_BR',
+      },
+    });
+    const responseData = await orderRes.json().catch(() => null);
+    return res
+      .status(orderRes.status)
+      .json(responseData ?? { success: false, message: 'Resposta inválida da Fruitfy.' });
+  } catch (err) {
+    console.error('Fruitfy GET /api/order error:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'Falha ao consultar pedido na Fruitfy.',
+    });
+  }
+});
+
 app.get('/api/order-status/:orderId', async (req, res) => {
   if (!TOKEN || !STORE_ID) {
     return res.status(500).json({
@@ -250,6 +286,7 @@ app.get('/api/order-status/:orderId', async (req, res) => {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${TOKEN}`,
         'Store-Id': STORE_ID,
+        'Accept-Language': 'pt_BR',
       },
     });
     const orderData = await orderRes.json().catch(() => ({}));
